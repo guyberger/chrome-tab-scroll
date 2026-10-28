@@ -36,7 +36,7 @@ release-to-commit follows whatever modifier you pick.
 
 ## Build
 
-Requires Node 20 or newer.
+Requires Node 22.12 or newer (Vitest's floor).
 
 ```bash
 npm ci
