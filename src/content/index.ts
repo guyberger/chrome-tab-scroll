@@ -5,21 +5,23 @@ import type { FromOverlayMessage, ToOverlayMessage } from '../shared/types';
 /**
  * Content-script host for the switcher strip.
  *
- * The strip lives in a closed ShadowRoot on a dedicated element so neither the
- * page's CSS nor its scripts can disturb it. Listeners are attached in the
- * capture phase and only while the strip is open, so the page keeps every key
- * it normally handles the rest of the time.
+ * The overlay is built as soon as this script runs and then kept warm, so a
+ * keypress only has to fill in cards and unhide an element that is already
+ * attached and styled.
+ *
+ * While the strip is open every key event is swallowed. That keeps Tab and
+ * Shift+Tab for moving the selection, and stops anything else — in
+ * particular a modifier-composed character such as macOS Option+Q's "oe" —
+ * from reaching the page. Listeners are only attached while the strip is
+ * open, so the page behaves completely normally the rest of the time.
  */
 
 const HOST_ID = 'chrome-tab-scroll-overlay-host';
 
-/** Dismisses a strip that was somehow left open, e.g. a missed modifier keyup. */
-const INACTIVITY_CANCEL_MS = 6000;
-
 let overlay: OverlayView | null = null;
 let hostElement: HTMLElement | null = null;
 let commitModifiers: string[] = [];
-let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+let epoch = -1;
 
 function send(message: FromOverlayMessage): void {
   void chrome.runtime.sendMessage(message).catch(() => {
@@ -32,58 +34,48 @@ function ensureOverlay(): OverlayView {
 
   hostElement = document.createElement('div');
   hostElement.id = HOST_ID;
-  // The page's own stylesheet cannot reach inside the shadow root, but it can
-  // still style this host element, so pin the few things that would matter.
-  hostElement.style.cssText = 'all: initial; position: fixed; inset: 0; z-index: 2147483647;';
-  hostElement.style.setProperty('display', 'block', 'important');
-
+  hostElement.style.cssText = 'all: initial;';
   const root = hostElement.attachShadow({ mode: 'closed' });
+  overlay = new OverlayView(root);
   document.documentElement.appendChild(hostElement);
-
-  overlay = new OverlayView(root, {
-    onPick: (index) => send({ type: 'COMMIT', index }),
-    onCancel: () => send({ type: 'CANCEL' }),
-  });
   return overlay;
 }
 
-function teardown(): void {
-  clearTimeout(inactivityTimer);
-  detachListeners();
-  overlay?.destroy();
-  overlay = null;
-  hostElement?.remove();
-  hostElement = null;
+function commit(): void {
+  const tabId = overlay?.selectedTabId();
+  if (tabId !== undefined) send({ type: 'COMMIT', epoch, tabId });
+  close();
 }
 
-function bumpInactivity(): void {
-  clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(() => send({ type: 'CANCEL' }), INACTIVITY_CANCEL_MS);
+function close(): void {
+  detachListeners();
+  overlay?.hide();
 }
 
 function onKeydown(event: KeyboardEvent): void {
-  const action = keydownAction(event);
-  if (!action) return;
+  // Modal: the page sees nothing while the strip is up.
   event.preventDefault();
-  event.stopPropagation();
-  bumpInactivity();
+  event.stopImmediatePropagation();
 
-  if (action.kind === 'cancel') send({ type: 'CANCEL' });
-  else if (action.kind === 'commit') send({ type: 'COMMIT' });
-  else send({ type: 'STEP', delta: action.delta });
+  const action = keydownAction(event);
+  if (action) send({ type: 'STEP', epoch, delta: action.delta });
 }
 
 function onKeyup(event: KeyboardEvent): void {
   if (keyupAction(event, commitModifiers)?.kind === 'commit') {
     event.preventDefault();
-    event.stopPropagation();
-    send({ type: 'COMMIT' });
+    event.stopImmediatePropagation();
+    commit();
   }
 }
 
-/** If the page loses focus entirely the modifier keyup will never arrive. */
+/**
+ * If focus leaves the page the modifier release will never arrive. Releasing
+ * is the only way this interaction ends, so resolve it the same way rather
+ * than stranding the strip on screen.
+ */
 function onBlur(): void {
-  send({ type: 'CANCEL' });
+  if (overlay?.isOpen) commit();
 }
 
 function attachListeners(): void {
@@ -98,23 +90,43 @@ function detachListeners(): void {
   window.removeEventListener('blur', onBlur, true);
 }
 
-chrome.runtime.onMessage.addListener((message: ToOverlayMessage) => {
+chrome.runtime.onMessage.addListener((message: ToOverlayMessage, _sender, sendResponse) => {
   switch (message.type) {
     case 'SHOW': {
+      epoch = message.epoch;
       commitModifiers = message.commitModifiers;
       const view = ensureOverlay();
       view.render(message.items, message.selectedIndex);
       detachListeners();
       attachListeners();
-      bumpInactivity();
       break;
     }
+    case 'THUMBS':
+      if (message.epoch === epoch) {
+        void overlay?.applyThumbnails(message.thumbs, message.mime);
+      }
+      break;
     case 'UPDATE':
-      overlay?.updateSelection(message.selectedIndex);
-      bumpInactivity();
+      if (message.epoch === epoch) overlay?.updateSelection(message.selectedIndex);
       break;
     case 'HIDE':
-      teardown();
+      close();
       break;
   }
+  sendResponse?.(true);
+  return undefined;
 });
+
+// Build the overlay up front rather than on the hot path. At document_start
+// the parser may not have produced <html> yet.
+if (document.documentElement) {
+  ensureOverlay();
+} else {
+  document.addEventListener(
+    'readystatechange',
+    () => {
+      if (document.documentElement) ensureOverlay();
+    },
+    { once: true },
+  );
+}

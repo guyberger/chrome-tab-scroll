@@ -236,6 +236,59 @@ supported — release-to-commit follows the new binding automatically.
 
 ---
 
+## 3a. Revision: Tab stepping inside the overlay
+
+The interaction was later cut to three things — the hotkey opens the strip,
+Tab and Shift+Tab move the highlight while the modifier is still held, and
+releasing the modifier switches. Everything else (a second backward command,
+arrow keys, Enter, Escape, clicking a card) was removed.
+
+This is **not** the Shift+Tab hijack rejected in 2.2. The difference is scope:
+nothing is bound globally, and the keys are captured only while the strip is
+open with the modifier held. Outside that moment the page's forward and
+reverse focus traversal is untouched, which was the whole objection.
+
+Taking Tab as the stepping key does change the modifier analysis, and it
+reverses what would otherwise have been the macOS choice.
+
+### MacCtrl is now ruled out
+
+`MacCtrl+Q` looks attractive on macOS — Control is not a text-composition
+modifier there, so a missed keystroke can never insert a character, whereas
+Option+Q composes "œ". But **`Control`+`Tab` is Chrome's own next-tab
+shortcut on macOS**. The browser would swallow every Tab press before the page
+saw it, so the stepping half of the interaction would simply not work. Option
+is therefore the right modifier on macOS, and the composed-character risk is
+handled in the overlay instead: while the strip is open the content script
+swallows every key event, so nothing reaches the page.
+
+### Alt+Tab belongs to the OS on Windows and Linux
+
+On macOS, `Option`+`Tab` is claimed by neither the system nor Chrome, so it
+reaches the page. On Windows and on most Linux desktops `Alt`+`Tab` is the
+window switcher and is intercepted before the browser ever sees it.
+
+This was measured rather than assumed. With a page-level listener counting Tab
+keydowns while Alt was held on an xfwm4 desktop, the page received **0** of 3
+presses. After disabling the window manager's `<Alt>Tab` binding the same test
+received **3** of 3, confirming the interception is the desktop's and that the
+extension's own handling is correct.
+
+There is no way around it within the stated design: `Alt`+`Tab` is taken by
+the OS and `Ctrl`+`Tab` is taken by Chrome, so no modifier+Tab pair is free on
+those platforms. The consequence is that on Windows and Linux the strip opens
+and release-to-commit still works — giving Alt+Tab-style "switch to the
+previous tab" — but the highlight cannot be moved. The full gesture is a macOS
+feature.
+
+### There is no cancel
+
+With Escape and click-outside removed, releasing the modifier is the only way
+the interaction ends, and it always switches. The one place this needed care
+is losing focus mid-gesture, where the modifier release will never be
+delivered: the overlay resolves that the same way rather than stranding itself
+on screen.
+
 ## 4. What this implies for the implementation
 
 Decisions that follow directly from the findings above:
@@ -246,10 +299,29 @@ Decisions that follow directly from the findings above:
 - **Order is tracked per window.** `tabs.onActivated` alone is not enough;
   `windows.onFocusChanged` has to promote the newly focused window's active tab,
   or the order goes stale the moment someone uses two windows.
-- **Thumbnails are captured on activation**, debounced, downscaled to 320×200
-  JPEG, and capped, for the quota and storage reasons in 2.4.
+- **Thumbnails are captured on activation**, debounced, downscaled to 256×160
+  WebP, and capped, for the quota and storage reasons in 2.4. They are sent
+  to the overlay only after the strip is already on screen, so nothing about
+  them is on the path to the first paint.
+- **Thumbnails are drawn into a canvas, not an `<img>`.** The strip lives in
+  the page's document, so an `<img src="data:…">` is subject to the page's
+  `img-src`. A page serving `img-src 'self'` was observed blocking exactly
+  that. Decoding the bytes in the content script and drawing them means no
+  document-level resource load happens at all.
+- **Whether to use the fallback window is decided from the tab's URL**, never
+  from a failed message. The bundler loads the content script through a
+  dynamic import, so a perfectly ordinary tab can be injectable and not yet
+  listening; treating that as "this page forbids content scripts" is what put
+  the fallback window on top of normal sites.
 - **The overlay lives in a closed Shadow DOM.** It is injected into arbitrary
   pages, so site CSS must not be able to reach it, and inheritable properties
   are reset explicitly on the container.
 - **Selection starts at index 1.** Index 0 is the current tab, so a single
   press-and-release lands on the previous tab, matching Alt+Tab and Firefox.
+- **Commit carries a tab id, not an index.** The overlay reports the tab it
+  highlighted, and the background honours it only if that tab is still part of
+  the session. An index is meaningless across two processes whose copies of
+  the list can diverge.
+- **Every session carries an epoch** and messages quoting an older one are
+  dropped, so an overlay left over from a previous invocation cannot step or
+  commit the current one.

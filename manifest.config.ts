@@ -6,9 +6,9 @@ export default defineManifest({
   name: 'Tab Scroll — MRU Tab Switcher',
   version: pkg.version,
   description:
-    'Jump between recently used tabs with a thumbnail strip, like Arc and Firefox Ctrl+Tab.',
+    'Hold Alt and tap Q for a strip of recent tabs. Tab to move, release to switch.',
 
-  // "tabs" is needed to read title/url/favIconUrl; host permissions are what
+  // "tabs" is needed to read title and favicon; host permissions are what
   // actually allow captureVisibleTab and content-script injection anywhere.
   permissions: ['tabs', 'storage', 'scripting'],
   host_permissions: ['<all_urls>'],
@@ -22,7 +22,9 @@ export default defineManifest({
     {
       matches: ['<all_urls>'],
       js: ['src/content/index.ts'],
-      run_at: 'document_idle',
+      // document_start keeps the warm overlay ready long before a heavy app
+      // like Gmail goes idle, which is when the hotkey is likely to be used.
+      run_at: 'document_start',
       all_frames: false,
     },
   ],
@@ -31,17 +33,17 @@ export default defineManifest({
     default_title: 'Show recent tabs',
   },
 
-  // Tab cannot be bound here: chrome.commands accepts only A-Z, 0-9, a short
-  // list of named keys and the media keys, and every binding must include Ctrl
-  // or Alt. See docs/RESEARCH.md for why that rules out the Firefox gesture.
+  // One binding, deliberately. Tab cannot be bound here at all — chrome.commands
+  // accepts only A-Z, 0-9, a short list of named keys and the media keys, and
+  // every binding must include Ctrl or Alt. See docs/RESEARCH.md.
+  //
+  // Alt is Option on macOS, and Option+Tab is free there, which is what lets
+  // Tab move the selection. MacCtrl was considered and rejected: Control+Tab
+  // is Chrome's own next-tab shortcut on macOS and would never reach the page.
   commands: {
-    'cycle-forward': {
+    'open-switcher': {
       suggested_key: { default: 'Alt+Q' },
-      description: 'Show recent tabs / move forward through them',
-    },
-    'cycle-backward': {
-      suggested_key: { default: 'Alt+Shift+Q' },
-      description: 'Show recent tabs / move backward through them',
+      description: 'Show recent tabs (hold the modifier, Tab to move, release to switch)',
     },
   },
 

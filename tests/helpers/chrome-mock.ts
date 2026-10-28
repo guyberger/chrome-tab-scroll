@@ -57,6 +57,7 @@ export interface ChromeMock {
     sendMessage: ReturnType<typeof vi.fn>;
     captureVisibleTab: ReturnType<typeof vi.fn>;
     onActivated: Event<[{ tabId: number; windowId: number }]>;
+    onCreated: Event<[FakeTab]>;
     onRemoved: Event<[number, { windowId: number; isWindowClosing: boolean }]>;
     onAttached: Event<[number, { newWindowId: number; newPosition: number }]>;
     onReplaced: Event<[number, number]>;
@@ -146,6 +147,7 @@ export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): Chr
       sendMessage: vi.fn(async () => undefined),
       captureVisibleTab: vi.fn(async () => 'data:image/jpeg;base64,AAAA'),
       onActivated: new Event(),
+      onCreated: new Event(),
       onRemoved: new Event(),
       onAttached: new Event(),
       onReplaced: new Event(),
