@@ -16,6 +16,8 @@ export interface FakeTab {
   title?: string;
   url?: string;
   favIconUrl?: string;
+  /** Chrome reports this; the MRU seed sorts by it. */
+  lastAccessed?: number;
 }
 
 class Event<Args extends unknown[]> {
@@ -37,6 +39,14 @@ class Event<Args extends unknown[]> {
   }
 }
 
+interface Area {
+  get: ReturnType<typeof vi.fn>;
+  set: ReturnType<typeof vi.fn>;
+  remove: ReturnType<typeof vi.fn>;
+  clear: ReturnType<typeof vi.fn>;
+  _data: Record<string, unknown>;
+}
+
 /**
  * Drains pending microtasks so `async` listeners finish before assertions.
  *
@@ -53,6 +63,7 @@ export interface ChromeMock {
   tabs: {
     query: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
+    create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
     sendMessage: ReturnType<typeof vi.fn>;
     captureVisibleTab: ReturnType<typeof vi.fn>;
@@ -87,14 +98,10 @@ export interface ChromeMock {
     lastError: undefined;
   };
   scripting: { executeScript: ReturnType<typeof vi.fn> };
+  permissions: { contains: ReturnType<typeof vi.fn> };
   storage: {
-    session: {
-      get: ReturnType<typeof vi.fn>;
-      set: ReturnType<typeof vi.fn>;
-      remove: ReturnType<typeof vi.fn>;
-      clear: ReturnType<typeof vi.fn>;
-      _data: Record<string, unknown>;
-    };
+    session: Area;
+    local: Area;
   };
   /** Test-only handle on the tab table backing `tabs.query` / `tabs.get`. */
   _tabs: FakeTab[];
@@ -102,11 +109,9 @@ export interface ChromeMock {
   _focusedWindowId: number;
 }
 
-export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): ChromeMock {
+function createArea(): Area {
   const store: Record<string, unknown> = {};
-  const tabTable = [...tabs];
-
-  const session = {
+  return {
     _data: store,
     get: vi.fn(async (keys?: string | string[] | null) => {
       if (keys === null || keys === undefined) return { ...store };
@@ -125,6 +130,12 @@ export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): Chr
       for (const k of Object.keys(store)) delete store[k];
     }),
   };
+}
+
+export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): ChromeMock {
+  const tabTable = [...tabs];
+  const session = createArea();
+  const local = createArea();
 
   const mock: ChromeMock = {
     _tabs: tabTable,
@@ -143,6 +154,7 @@ export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): Chr
         if (!tab) throw new Error(`No tab with id: ${tabId}`);
         return tab;
       }),
+      create: vi.fn(async () => ({ id: 1234 })),
       update: vi.fn(async () => undefined),
       sendMessage: vi.fn(async () => undefined),
       captureVisibleTab: vi.fn(async () => 'data:image/jpeg;base64,AAAA'),
@@ -154,7 +166,13 @@ export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): Chr
       onUpdated: new Event(),
     },
     windows: {
-      getLastFocused: vi.fn(async () => ({ id: mock._focusedWindowId })),
+      getLastFocused: vi.fn(async () => ({
+        id: mock._focusedWindowId,
+        left: 100,
+        top: 50,
+        width: 1200,
+        height: 800,
+      })),
       create: vi.fn(async () => ({ id: 99 })),
       remove: vi.fn(async () => undefined),
       update: vi.fn(async () => undefined),
@@ -177,7 +195,8 @@ export function createChromeMock(tabs: FakeTab[] = [], focusedWindowId = 1): Chr
       lastError: undefined,
     },
     scripting: { executeScript: vi.fn(async () => [{ result: null }]) },
-    storage: { session },
+    permissions: { contains: vi.fn(async () => true) },
+    storage: { session, local },
   };
 
   return mock;

@@ -1,16 +1,13 @@
 /**
  * Keyboard interpretation for an open switcher.
  *
- * The whole interaction is three things: the hotkey opens the strip, Tab and
- * Shift+Tab move the selection while the modifier is still held, and
- * releasing the modifier switches. Nothing else is bound.
+ * The whole interaction is three things: the hotkey opens the strip, tapping
+ * the hotkey's letter again moves the selection while the modifier is still
+ * held, and releasing the modifier switches. Nothing else is bound.
  *
- * Tab is only ever claimed while the strip is open, so the page keeps normal
- * forward and reverse focus traversal at every other moment. That is what
- * makes this safe where a global Shift+Tab binding would not be.
- *
- * Both `key` and `code` are consulted. On macOS a modifier can rewrite `key`
- * into a composed character, and `code` is the layout-independent fallback.
+ * Everything matches on `event.code`, never `event.key`. On macOS
+ * Option+Q reports `key` as "œ" — the Option key composes characters — while
+ * `code` stays `KeyQ` regardless of layout or modifier.
  */
 
 export type KeyAction = { kind: 'step'; delta: number } | null;
@@ -18,6 +15,7 @@ export type KeyAction = { kind: 'step'; delta: number } | null;
 export interface KeyLike {
   key: string;
   code?: string;
+  altKey?: boolean;
   shiftKey?: boolean;
 }
 
@@ -35,12 +33,16 @@ const MODIFIER_BY_CODE: Record<string, string> = {
   ShiftRight: 'Shift',
 };
 
-export function isTabKey(event: KeyLike): boolean {
-  return event.key === 'Tab' || event.code === 'Tab';
-}
-
+/**
+ * Another tap of the hotkey letter, with the modifier still down, moves the
+ * selection; adding Shift moves it backward.
+ *
+ * In practice Chrome usually swallows this itself and delivers it as a
+ * command instead, so this is the path for when the page does see the key.
+ * The background collapses an exact repeat arriving from both at once.
+ */
 export function keydownAction(event: KeyLike): KeyAction {
-  if (!isTabKey(event)) return null;
+  if (event.code !== 'KeyQ' || !event.altKey) return null;
   return { kind: 'step', delta: event.shiftKey ? -1 : 1 };
 }
 

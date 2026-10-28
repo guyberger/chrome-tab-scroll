@@ -30,20 +30,25 @@ export default defineManifest({
   ],
 
   action: {
-    default_title: 'Show recent tabs',
+    default_title: 'Tab Scroll',
+    // Chrome often declines to honour a suggested shortcut, so clicking the
+    // icon shows whether one is assigned and links to the page that assigns
+    // it. Extensions cannot set shortcuts themselves.
+    default_popup: 'src/setup/index.html',
   },
 
-  // One binding, deliberately. Tab cannot be bound here at all — chrome.commands
-  // accepts only A-Z, 0-9, a short list of named keys and the media keys, and
-  // every binding must include Ctrl or Alt. See docs/RESEARCH.md.
-  //
-  // Alt is Option on macOS, and Option+Tab is free there, which is what lets
-  // Tab move the selection. MacCtrl was considered and rejected: Control+Tab
-  // is Chrome's own next-tab shortcut on macOS and would never reach the page.
+  // Alt is Option on macOS. The letter doubles as the step key while the
+  // modifier is held, so the second binding only adds Shift. Tab cannot be
+  // bound here at all — chrome.commands accepts only A-Z, 0-9, a short list
+  // of named keys and the media keys. See docs/RESEARCH.md.
   commands: {
     'open-switcher': {
       suggested_key: { default: 'Alt+Q' },
-      description: 'Show recent tabs (hold the modifier, Tab to move, release to switch)',
+      description: 'Show recent tabs / move forward through them',
+    },
+    'cycle-backward': {
+      suggested_key: { default: 'Alt+Shift+Q' },
+      description: 'Show recent tabs / move backward through them',
     },
   },
 

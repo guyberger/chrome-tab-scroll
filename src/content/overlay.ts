@@ -79,6 +79,9 @@ const CSS = `
 }
 .preview canvas { width: 100%; height: 100%; object-fit: cover; display: block; }
 .preview .placeholder { font-size: 22px; opacity: 0.4; }
+/* A tab not visited since the extension loaded has no capture, which is most
+   of them on day one. Its favicon reads better than an empty box. */
+.preview .placeholder-icon { width: 34px; height: 34px; opacity: 0.85; }
 
 .meta { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
 .favicon { width: 15px; height: 15px; flex: 0 0 auto; border-radius: 3px; }
@@ -92,6 +95,13 @@ const CSS = `
   color: #f5f5f7;
 }
 `;
+
+function makePlaceholder(doc: Document): HTMLElement {
+  const placeholder = doc.createElement('div');
+  placeholder.className = 'placeholder';
+  placeholder.textContent = '\u25FB';
+  return placeholder;
+}
 
 function decodeBase64(base64: string): Uint8Array {
   const binary = atob(base64);
@@ -162,10 +172,16 @@ export class OverlayView {
 
       const preview = doc.createElement('div');
       preview.className = 'preview';
-      const placeholder = doc.createElement('div');
-      placeholder.className = 'placeholder';
-      placeholder.textContent = '\u25FB';
-      preview.appendChild(placeholder);
+      if (item.favIconUrl) {
+        const icon = doc.createElement('img');
+        icon.className = 'placeholder-icon';
+        icon.src = item.favIconUrl;
+        icon.alt = '';
+        icon.addEventListener('error', () => icon.replaceWith(makePlaceholder(doc)));
+        preview.appendChild(icon);
+      } else {
+        preview.appendChild(makePlaceholder(doc));
+      }
       this.previews.set(item.tabId, preview);
 
       const meta = doc.createElement('div');

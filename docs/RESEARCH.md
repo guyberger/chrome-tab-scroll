@@ -289,6 +289,61 @@ is losing focus mid-gesture, where the modifier release will never be
 delivered: the overlay resolves that the same way rather than stranding itself
 on screen.
 
+## 3b. Revision: stepping moves back to the hotkey letter
+
+Section 3a described stepping with Tab and Shift+Tab inside the overlay. That
+has been reverted: the selection now moves with another tap of **Alt+Q**, and
+backward with **Alt+Shift+Q**, which is a second `chrome.commands` binding.
+
+The measurement in 3a is the reason this is an improvement rather than a
+lateral move. Tab stepping only ever worked on macOS, because `Alt`+`Tab` is
+the window switcher on Windows and Linux and never reaches the page — 0 of 3
+presses arrived in the test there. `Alt`+`Q` is not a window-manager
+shortcut anywhere, and because it is a registered extension command Chrome
+delivers it to the service worker regardless of what the page is doing. **The
+platform limitation in 3a disappears entirely.**
+
+Two paths can now move the selection:
+
+- the `chrome.commands` binding, which works even when focus is not in the
+  page; and
+- a `keydown` in the overlay matching `code === 'KeyQ'` with `altKey`, which
+  covers the case where the page does see the key.
+
+Matching on `code` is not optional. On a US Mac layout Option+Q reports
+`event.key` as `"œ"` and Option+Shift+Q as `"Œ"`, because Option is macOS's
+character-composition modifier; `event.code` stays `KeyQ` whatever the layout.
+
+In practice Chrome swallows the combination and delivers the command, so only
+one of the two fires. The background collapses an identical step arriving
+from both within 40 ms, so even if that ever changes the selection moves once.
+
+## 3c. Routing to the overlay instead of the popup window
+
+A build of this extension kept opening its popup window on ordinary pages on
+a machine the author could not reproduce on. Three properties of the old
+routing could each produce that, and all three were changed:
+
+- **The active tab and its URL were read from a cache.** They are now queried
+  with `chrome.tabs.query({ active: true, lastFocusedWindow: true })`. The
+  cache can disagree with reality immediately after an install or reload, and
+  a wrong URL here decided the route.
+- **An unknown URL counted as restricted.** Classification now has three
+  outcomes, and only *known* restricted schemes route to the popup; anything
+  unrecognised is attempted in the page first.
+- **A timeout could choose the popup.** An `http(s)` page is always capable of
+  hosting the overlay, so a failure there is now logged and nothing is shown.
+  A window thrown on top of an ordinary page is worse than no response.
+
+Alongside that, the content script is injected into existing `http(s)` tabs at
+install and at browser startup, so a tab that predates the extension does not
+have to wait for an injection on the first keypress.
+
+Because none of this is reproducible by the author, every branch writes to a
+ring buffer that the toolbar popup can copy out. The log names the decision
+point directly — `route:overlay`, `route:popup`, `inject:failed`,
+`show:timeout`, `route:none` — rather than leaving it to be inferred.
+
 ## 4. What this implies for the implementation
 
 Decisions that follow directly from the findings above:
