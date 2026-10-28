@@ -3,13 +3,21 @@ import type { SwitcherItem } from '../shared/types';
 /**
  * The switcher strip.
  *
- * Renders into a ShadowRoot supplied by the caller so the page's stylesheets
- * cannot reach it, and so tests can hand it a detached root instead of a real
- * document. Every property that inherits through a shadow boundary (font,
- * colour, line-height, direction) is reset explicitly on the container.
+ * Two things matter here beyond drawing boxes.
+ *
+ * It is built once and kept warm. Creating the shadow root and parsing the
+ * stylesheet on every keypress was a large part of why the strip used to
+ * appear late; `render` now only swaps the cards of an element that is
+ * already attached and styled.
+ *
+ * Thumbnails are painted into a canvas rather than loaded into an `<img>`.
+ * The strip lives in the page's document, so an `<img src="data:…">` is
+ * subject to the page's `img-src`, which strict sites do restrict. Decoding
+ * the bytes here and drawing them means no document-level resource load
+ * happens and no CSP applies.
  */
 
-const STYLES = `
+const CSS = `
 :host { all: initial; }
 
 .backdrop {
@@ -19,8 +27,6 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Dark and blurred enough that page text behind the strip cannot be mistaken
-     for part of it. */
   background: rgba(0, 0, 0, 0.62);
   backdrop-filter: blur(7px);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -32,10 +38,8 @@ const STYLES = `
   text-align: left;
   direction: ltr;
   color: #f5f5f7;
-  animation: fade 90ms ease-out;
 }
-
-@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+.backdrop[hidden] { display: none; }
 
 .strip {
   display: flex;
@@ -57,10 +61,7 @@ const STYLES = `
   border-radius: 11px;
   border: 2px solid transparent;
   background: rgba(255, 255, 255, 0.06);
-  cursor: pointer;
-  transition: border-color 80ms linear, background-color 80ms linear;
 }
-.card:hover { background: rgba(255, 255, 255, 0.11); }
 .card[data-selected="true"] {
   border-color: #6aa8ff;
   background: rgba(106, 168, 255, 0.18);
@@ -76,7 +77,7 @@ const STYLES = `
   align-items: center;
   justify-content: center;
 }
-.preview img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.preview canvas { width: 100%; height: 100%; object-fit: cover; display: block; }
 .preview .placeholder { font-size: 22px; opacity: 0.4; }
 
 .meta { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
@@ -90,81 +91,82 @@ const STYLES = `
   text-overflow: ellipsis;
   color: #f5f5f7;
 }
-
-.hint {
-  margin-top: 10px;
-  text-align: center;
-  font-size: 11px;
-  opacity: 0.55;
-  color: #f5f5f7;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .backdrop { animation: none; }
-  .card { transition: none; }
-}
 `;
 
-export interface OverlayCallbacks {
-  onPick(index: number): void;
-  onCancel(): void;
+function decodeBase64(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 export class OverlayView {
   private readonly root: ShadowRoot;
-  private readonly callbacks: OverlayCallbacks;
-  private container: HTMLElement | null = null;
+  private readonly backdrop: HTMLElement;
+  private readonly strip: HTMLElement;
   private cards: HTMLElement[] = [];
+  private previews = new Map<number, HTMLElement>();
+  private open = false;
 
-  constructor(root: ShadowRoot, callbacks: OverlayCallbacks) {
+  constructor(root: ShadowRoot) {
     this.root = root;
-    this.callbacks = callbacks;
+    const doc = root.ownerDocument ?? document;
+
+    // Constructed stylesheets are parsed once and attached without putting a
+    // <style> element into the page.
+    if ('adoptedStyleSheets' in root && typeof CSSStyleSheet !== 'undefined') {
+      try {
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(CSS);
+        root.adoptedStyleSheets = [sheet];
+      } catch {
+        this.appendStyleElement(doc);
+      }
+    } else {
+      this.appendStyleElement(doc);
+    }
+
+    this.backdrop = doc.createElement('div');
+    this.backdrop.className = 'backdrop';
+    this.backdrop.hidden = true;
+
+    this.strip = doc.createElement('div');
+    this.strip.className = 'strip';
+    this.strip.setAttribute('role', 'listbox');
+    this.strip.setAttribute('aria-label', 'Recently used tabs');
+
+    this.backdrop.appendChild(this.strip);
+    root.appendChild(this.backdrop);
+  }
+
+  private appendStyleElement(doc: Document): void {
+    const style = doc.createElement('style');
+    style.textContent = CSS;
+    this.root.appendChild(style);
   }
 
   get isOpen(): boolean {
-    return this.container !== null;
+    return this.open;
   }
 
   render(items: SwitcherItem[], selectedIndex: number): void {
-    this.destroy();
-
     const doc = this.root.ownerDocument ?? document;
-
-    const style = doc.createElement('style');
-    style.textContent = STYLES;
-
-    const backdrop = doc.createElement('div');
-    backdrop.className = 'backdrop';
-    backdrop.addEventListener('mousedown', (event) => {
-      if (event.target === backdrop) this.callbacks.onCancel();
-    });
-
-    const panel = doc.createElement('div');
-
-    const strip = doc.createElement('div');
-    strip.className = 'strip';
-    strip.setAttribute('role', 'listbox');
-    strip.setAttribute('aria-label', 'Recently used tabs');
+    this.previews.clear();
 
     this.cards = items.map((item, index) => {
       const card = doc.createElement('div');
       card.className = 'card';
       card.setAttribute('role', 'option');
       card.dataset.index = String(index);
+      card.dataset.tabId = String(item.tabId);
 
       const preview = doc.createElement('div');
       preview.className = 'preview';
-      if (item.thumbnail) {
-        const img = doc.createElement('img');
-        img.src = item.thumbnail;
-        img.alt = '';
-        preview.appendChild(img);
-      } else {
-        const placeholder = doc.createElement('div');
-        placeholder.className = 'placeholder';
-        placeholder.textContent = '◻';
-        preview.appendChild(placeholder);
-      }
+      const placeholder = doc.createElement('div');
+      placeholder.className = 'placeholder';
+      placeholder.textContent = '\u25FB';
+      preview.appendChild(placeholder);
+      this.previews.set(item.tabId, preview);
 
       const meta = doc.createElement('div');
       meta.className = 'meta';
@@ -173,6 +175,8 @@ export class OverlayView {
         favicon.className = 'favicon';
         favicon.src = item.favIconUrl;
         favicon.alt = '';
+        // A strict img-src can block this; the title alone is still readable.
+        favicon.addEventListener('error', () => favicon.remove());
         meta.appendChild(favicon);
       }
       const title = doc.createElement('div');
@@ -181,21 +185,13 @@ export class OverlayView {
       meta.appendChild(title);
 
       card.append(preview, meta);
-      card.addEventListener('mouseup', () => this.callbacks.onPick(index));
-      strip.appendChild(card);
       return card;
     });
 
-    const hint = doc.createElement('div');
-    hint.className = 'hint';
-    hint.textContent = 'Release the modifier or press Enter to switch · ← → to move · Esc to cancel';
-
-    panel.append(strip, hint);
-    backdrop.appendChild(panel);
-    this.root.append(style, backdrop);
-    this.container = backdrop;
-
+    this.strip.replaceChildren(...this.cards);
     this.updateSelection(selectedIndex);
+    this.backdrop.hidden = false;
+    this.open = true;
   }
 
   updateSelection(selectedIndex: number): void {
@@ -203,15 +199,45 @@ export class OverlayView {
       const selected = index === selectedIndex;
       card.dataset.selected = String(selected);
       card.setAttribute('aria-selected', String(selected));
-      if (selected) {
-        card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      }
+      if (selected) card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     });
   }
 
-  destroy(): void {
-    this.root.replaceChildren();
-    this.container = null;
+  /** The tab the highlighted tile belongs to, which is what gets committed. */
+  selectedTabId(): number | undefined {
+    const card = this.cards.find((c) => c.dataset.selected === 'true');
+    const raw = card?.dataset.tabId;
+    return raw === undefined ? undefined : Number(raw);
+  }
+
+  /** Fills in previews after the strip is already on screen. */
+  async applyThumbnails(thumbs: Record<number, string>, mime: string): Promise<void> {
+    await Promise.all(
+      Object.entries(thumbs).map(async ([rawTabId, base64]) => {
+        const preview = this.previews.get(Number(rawTabId));
+        if (!preview || !base64) return;
+        try {
+          const blob = new Blob([decodeBase64(base64).buffer as ArrayBuffer], { type: mime });
+          const bitmap = await createImageBitmap(blob);
+          const doc = this.root.ownerDocument ?? document;
+          const canvas = doc.createElement('canvas');
+          canvas.width = bitmap.width;
+          canvas.height = bitmap.height;
+          canvas.getContext('2d')?.drawImage(bitmap, 0, 0);
+          bitmap.close();
+          preview.replaceChildren(canvas);
+        } catch {
+          // Leave the placeholder; a missing preview is not worth failing over.
+        }
+      }),
+    );
+  }
+
+  hide(): void {
+    this.backdrop.hidden = true;
+    this.strip.replaceChildren();
     this.cards = [];
+    this.previews.clear();
+    this.open = false;
   }
 }

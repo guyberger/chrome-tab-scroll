@@ -43,7 +43,11 @@ jobs:
             if (m.manifest_version !== 3) throw new Error('expected MV3');
             if (!m.background?.service_worker) throw new Error('no service worker');
             if (!m.content_scripts?.length) throw new Error('no content script');
-            if (!m.commands?.['cycle-forward']) throw new Error('no forward command');
+            const commands = Object.keys(m.commands ?? {});
+            // Exactly one binding: the hotkey opens the strip, Tab moves it.
+            if (commands.length !== 1 || commands[0] !== 'open-switcher') {
+              throw new Error('expected a single open-switcher command, got ' + commands.join(', '));
+            }
             console.log('manifest ok:', m.name, m.version);
           "
 

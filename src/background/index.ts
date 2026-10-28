@@ -1,66 +1,101 @@
 import { MruTracker } from './mru';
-import {
-  commitTarget,
-  openSession,
-  removeItem,
-  selectIndex,
-  stepSelection,
-} from './session';
+import { TabIndex } from './tab-index';
+import { openSession, removeItem, resolveCommit, stepSelection } from './session';
 import { parseShortcutModifiers } from './shortcut';
 import * as thumbnails from './thumbnails';
+import { canRunContentScript } from '../shared/restricted';
 import { MAX_ITEMS } from '../shared/types';
 import type { FromOverlayMessage, SessionState, SwitcherItem, ToOverlayMessage } from '../shared/types';
 
-const MRU_STORAGE_KEY = 'mru:order';
+const MRU_KEY = 'mru:order';
+const TABS_KEY = 'mru:tabs';
 const FALLBACK_PAGE = 'src/fallback/index.html';
-const FALLBACK_SIZE = { width: 760, height: 260 };
 
-export const CMD_FORWARD = 'cycle-forward';
-export const CMD_BACKWARD = 'cycle-backward';
+export const CMD_OPEN = 'open-switcher';
+
+/** How long to keep retrying a tab that should accept the overlay.
+ *  The bundler loads the content script through a dynamic import, so a tab
+ *  can be injectable but not yet listening; the old code read one failed
+ *  message as "this page forbids content scripts" and opened the fallback
+ *  window on ordinary sites. */
+const INJECT_RETRY_MS = 600;
+const INJECT_RETRY_STEP_MS = 25;
 
 let mru = new MruTracker();
+let tabs = new TabIndex();
 let ready: Promise<void> | null = null;
 
-/** Where the currently open strip is being rendered. */
-type Host =
-  | { kind: 'tab'; tabId: number }
-  | { kind: 'popup'; windowId: number };
+/** Cached so the hot path never awaits `chrome.commands.getAll()`. */
+let commitModifiers = parseShortcutModifiers(undefined);
+
+type Host = { kind: 'tab'; tabId: number } | { kind: 'popup'; windowId: number };
 
 let session: SessionState | null = null;
 let host: Host | null = null;
-/** The window the session switches within, i.e. where the user pressed the key. */
-let sessionWindowId: number | null = null;
+let sessionEpoch = 0;
 
 /* -------------------------------------------------------------------------- */
-/* MRU state                                                                  */
+/* State                                                                      */
 /* -------------------------------------------------------------------------- */
 
 async function ensureReady(): Promise<void> {
   ready ??= (async () => {
-    const stored = await chrome.storage.session.get(MRU_STORAGE_KEY);
-    mru = MruTracker.fromJSON(stored[MRU_STORAGE_KEY]);
+    const stored = await chrome.storage.session.get([MRU_KEY, TABS_KEY]);
+    mru = MruTracker.fromJSON(stored[MRU_KEY]);
+    tabs = TabIndex.fromJSON(stored[TABS_KEY]);
 
-    // Seed anything the tracker has not seen (first run, or after the service
-    // worker was evicted and storage.session was cleared with the browser).
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
+    const live = await chrome.tabs.query({});
+    for (const tab of live) {
+      if (isOwnPage(tab.url)) continue;
+      tabs.record(tab);
       if (tab.id !== undefined && tab.windowId !== undefined) {
         mru.append(tab.id, tab.windowId);
       }
     }
-    mru.retain(tabs.map((t) => t.id).filter((id): id is number => id !== undefined));
+    const liveIds = live.map((t) => t.id).filter((id): id is number => id !== undefined);
+    mru.retain(liveIds);
+    tabs.retain(liveIds);
 
-    // Put the focused tab in front so the very first press behaves sensibly.
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (active?.id !== undefined) mru.touch(active.id, active.windowId);
 
-    await persist();
+    await Promise.all([persist(), refreshModifiers()]);
   })();
   return ready;
 }
 
 async function persist(): Promise<void> {
-  await chrome.storage.session.set({ [MRU_STORAGE_KEY]: mru.toJSON() });
+  await chrome.storage.session.set({ [MRU_KEY]: mru.toJSON(), [TABS_KEY]: tabs.toJSON() });
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Debounced persistence for high-frequency events.
+ *
+ * `tabs.onUpdated` fires repeatedly through every navigation, and writing the
+ * whole tab index each time is pure overhead. Memory is the source of truth;
+ * storage only has to survive the service worker being evicted.
+ */
+function schedulePersist(): void {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => void persist(), 500);
+}
+
+async function refreshModifiers(): Promise<void> {
+  try {
+    const commands = await chrome.commands.getAll();
+    commitModifiers = parseShortcutModifiers(
+      commands.find((c) => c.name === CMD_OPEN)?.shortcut,
+    );
+  } catch {
+    commitModifiers = parseShortcutModifiers(undefined);
+  }
+}
+
+/** Our own fallback popup must never become a switch target. */
+function isOwnPage(url: string | undefined): boolean {
+  return !!url && url.startsWith(chrome.runtime.getURL(''));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -70,13 +105,39 @@ async function persist(): Promise<void> {
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   await ensureReady();
   mru.touch(tabId, windowId);
+  if (!tabs.get(tabId)) {
+    try {
+      tabs.record(await chrome.tabs.get(tabId));
+    } catch {
+      // Gone already.
+    }
+  }
   await persist();
   thumbnails.scheduleCapture(tabId, windowId);
+});
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  await ensureReady();
+  if (isOwnPage(tab.url)) return;
+  tabs.record(tab);
+  if (tab.id !== undefined && tab.windowId !== undefined) mru.append(tab.id, tab.windowId);
+  await persist();
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  await ensureReady();
+  if (isOwnPage(tab.url)) return;
+  tabs.record(tab);
+  schedulePersist();
+  if (changeInfo.status === 'complete' && tab.active) {
+    thumbnails.scheduleCapture(tabId, tab.windowId);
+  }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await ensureReady();
   mru.remove(tabId);
+  tabs.remove(tabId);
   await persist();
   await thumbnails.drop(tabId);
 
@@ -86,7 +147,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
       await endSession();
     } else if (next !== session) {
       session = next;
-      await sendToHost({ type: 'UPDATE', selectedIndex: session.selectedIndex });
+      await sendToHost({ type: 'UPDATE', epoch: session.epoch, selectedIndex: session.selectedIndex });
     }
   }
 });
@@ -94,20 +155,15 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.tabs.onAttached.addListener(async (tabId, { newWindowId }) => {
   await ensureReady();
   mru.reassign(tabId, newWindowId);
+  tabs.setWindow(tabId, newWindowId);
   await persist();
 });
 
 chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
   await ensureReady();
   mru.replace(addedTabId, removedTabId);
+  tabs.replace(addedTabId, removedTabId);
   await persist();
-});
-
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // A navigation makes the cached preview stale; re-shoot if it is on screen.
-  if (changeInfo.status === 'complete' && tab.active) {
-    thumbnails.scheduleCapture(tabId, tab.windowId);
-  }
 });
 
 chrome.windows.onRemoved.addListener(async (windowId) => {
@@ -117,7 +173,6 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   if (host?.kind === 'popup' && host.windowId === windowId) {
     session = null;
     host = null;
-    sessionWindowId = null;
   }
 });
 
@@ -125,69 +180,75 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   await ensureReady();
   const [active] = await chrome.tabs.query({ active: true, windowId });
-  if (active?.id !== undefined) {
-    mru.touch(active.id, windowId);
-    await persist();
-    thumbnails.scheduleCapture(active.id, windowId);
-  }
+  if (active?.id === undefined || isOwnPage(active.url)) return;
+  mru.touch(active.id, windowId);
+  await persist();
+  thumbnails.scheduleCapture(active.id, windowId);
 });
 
 /* -------------------------------------------------------------------------- */
 /* Building the strip                                                         */
 /* -------------------------------------------------------------------------- */
 
-async function buildItems(windowId: number): Promise<SwitcherItem[]> {
-  const entries = mru.listForWindow(windowId).slice(0, MAX_ITEMS);
-
-  const tabs = await Promise.all(
-    entries.map(async (entry) => {
-      try {
-        return await chrome.tabs.get(entry.tabId);
-      } catch {
-        return undefined;
-      }
-    }),
-  );
-
-  const live = tabs.filter((tab): tab is chrome.tabs.Tab => tab !== undefined && tab.id !== undefined);
-  const shots = await thumbnails.getMany(live.map((tab) => tab.id as number));
-
-  return live.map((tab) => ({
-    tabId: tab.id as number,
-    windowId: tab.windowId,
-    title: tab.title || tab.url || 'Untitled',
-    url: tab.url ?? '',
-    favIconUrl: tab.favIconUrl,
-    thumbnail: shots.get(tab.id as number),
-  }));
+/** Synchronous by design: this runs between the keypress and the first paint. */
+function buildItems(windowId: number): SwitcherItem[] {
+  const items: SwitcherItem[] = [];
+  for (const entry of mru.listForWindow(windowId)) {
+    if (isOwnPage(tabs.get(entry.tabId)?.url)) continue;
+    const item = tabs.toItem(entry.tabId);
+    if (item) items.push(item);
+    if (items.length >= MAX_ITEMS) break;
+  }
+  return items;
 }
 
-async function commitModifiers(): Promise<string[]> {
-  try {
-    const commands = await chrome.commands.getAll();
-    const forward = commands.find((c) => c.name === CMD_FORWARD);
-    return parseShortcutModifiers(forward?.shortcut);
-  } catch {
-    return parseShortcutModifiers(undefined);
-  }
+/** The active tab of a window is by definition its most recent one, so this
+ *  needs no `tabs.query` round trip on the hot path. */
+function activeTabOf(windowId: number) {
+  const first = mru.listForWindow(windowId)[0];
+  return first ? tabs.get(first.tabId) : undefined;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Session lifecycle                                                          */
 /* -------------------------------------------------------------------------- */
 
-async function sendToHost(message: ToOverlayMessage): Promise<boolean> {
-  if (!host) return false;
+async function post(target: Host, message: ToOverlayMessage): Promise<boolean> {
   try {
-    if (host.kind === 'tab') {
-      await chrome.tabs.sendMessage(host.tabId, message);
-    } else {
-      await chrome.runtime.sendMessage(message);
-    }
+    if (target.kind === 'tab') await chrome.tabs.sendMessage(target.tabId, message);
+    else await chrome.runtime.sendMessage(message);
     return true;
   } catch {
     return false;
   }
+}
+
+async function sendToHost(message: ToOverlayMessage): Promise<boolean> {
+  return host ? post(host, message) : false;
+}
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Shows the strip in a tab, injecting and retrying while the content script
+ * finishes loading. Only gives up once the budget is spent.
+ */
+async function showInTab(tabId: number, payload: ToOverlayMessage): Promise<boolean> {
+  if (await post({ kind: 'tab', tabId }, payload)) return true;
+
+  try {
+    const files = chrome.runtime.getManifest().content_scripts?.[0]?.js;
+    if (files?.length) await chrome.scripting.executeScript({ target: { tabId }, files });
+  } catch {
+    return false;
+  }
+
+  const deadline = Date.now() + INJECT_RETRY_MS;
+  while (Date.now() < deadline) {
+    if (await post({ kind: 'tab', tabId }, payload)) return true;
+    await wait(INJECT_RETRY_STEP_MS);
+  }
+  return false;
 }
 
 async function openFallbackWindow(): Promise<void> {
@@ -195,99 +256,92 @@ async function openFallbackWindow(): Promise<void> {
     url: chrome.runtime.getURL(FALLBACK_PAGE),
     type: 'popup',
     focused: true,
-    ...FALLBACK_SIZE,
+    width: 820,
+    height: 240,
   });
   if (created?.id !== undefined) host = { kind: 'popup', windowId: created.id };
   // The page pulls state itself via GET_SESSION once it has loaded.
 }
 
-async function startSession(delta: number): Promise<void> {
+/** Fetches previews and sends them once the strip is already on screen. */
+async function sendThumbnails(state: SessionState): Promise<void> {
+  const thumbs = await thumbnails.getMany(state.items.map((i) => i.tabId));
+  if (session?.epoch !== state.epoch || Object.keys(thumbs).length === 0) return;
+  await sendToHost({
+    type: 'THUMBS',
+    epoch: state.epoch,
+    thumbs,
+    mime: thumbnails.THUMB_MIME,
+  });
+}
+
+async function openSwitcher(): Promise<void> {
   const window = await chrome.windows.getLastFocused();
   if (window.id === undefined) return;
 
-  const items = await buildItems(window.id);
-  const opened = openSession(items);
+  const items = buildItems(window.id);
+  sessionEpoch += 1;
+  const opened = openSession(sessionEpoch, items);
   if (!opened) return;
+  session = opened;
 
-  session = delta >= 0 ? opened : stepSelection({ items, selectedIndex: 0 }, delta);
-  sessionWindowId = window.id;
-
-  const [active] = await chrome.tabs.query({ active: true, windowId: window.id });
   const payload: ToOverlayMessage = {
     type: 'SHOW',
-    items: session.items,
-    selectedIndex: session.selectedIndex,
-    commitModifiers: await commitModifiers(),
+    epoch: opened.epoch,
+    items: opened.items,
+    selectedIndex: opened.selectedIndex,
+    commitModifiers,
   };
 
-  if (active?.id !== undefined) {
-    host = { kind: 'tab', tabId: active.id };
-    if (await sendToHost(payload)) return;
+  const active = activeTabOf(window.id);
+
+  if (active && canRunContentScript(active.url)) {
+    host = { kind: 'tab', tabId: active.tabId };
+    if (await showInTab(active.tabId, payload)) {
+      void sendThumbnails(opened);
+      void refreshModifiers();
+      return;
+    }
   }
 
-  // Content scripts cannot run here (chrome://, the Web Store, the New Tab
-  // page, or a tab loaded before the extension was installed). Try a one-shot
-  // injection first, then fall back to a popup window.
-  if (active?.id !== undefined && (await injectInto(active.id))) {
-    host = { kind: 'tab', tabId: active.id };
-    if (await sendToHost(payload)) return;
-  }
-
+  // chrome://, the Web Store, the New Tab page: Chrome forbids content
+  // scripts outright, so the strip gets its own window.
   await openFallbackWindow();
-}
-
-/**
- * Injects the content script into a tab that does not already have it, which
- * happens for every tab that was open before the extension was installed or
- * reloaded. The filename comes from the manifest because the bundler rewrites
- * it at build time.
- */
-async function injectInto(tabId: number): Promise<boolean> {
-  const files = chrome.runtime.getManifest().content_scripts?.[0]?.js;
-  if (!files?.length) return false;
-  try {
-    await chrome.scripting.executeScript({ target: { tabId }, files });
-    return true;
-  } catch {
-    return false;
-  }
+  void sendThumbnails(opened);
+  void refreshModifiers();
 }
 
 async function step(delta: number): Promise<void> {
-  await ensureReady();
-  if (!session) {
-    await startSession(delta);
-    return;
-  }
+  if (!session) return;
   session = stepSelection(session, delta);
-  await sendToHost({ type: 'UPDATE', selectedIndex: session.selectedIndex });
+  await sendToHost({ type: 'UPDATE', epoch: session.epoch, selectedIndex: session.selectedIndex });
 }
 
 async function endSession(): Promise<void> {
-  await sendToHost({ type: 'HIDE' });
-  if (host?.kind === 'popup') {
+  const current = host;
+  const epoch = session?.epoch ?? sessionEpoch;
+  session = null;
+  host = null;
+  if (!current) return;
+  if (current.kind === 'popup') {
     try {
-      await chrome.windows.remove(host.windowId);
+      await chrome.windows.remove(current.windowId);
     } catch {
       // Already closed.
     }
+  } else {
+    await post(current, { type: 'HIDE', epoch });
   }
-  session = null;
-  host = null;
-  sessionWindowId = null;
 }
 
-async function commit(index?: number): Promise<void> {
+async function commit(tabId: number): Promise<void> {
   if (!session) return;
-  const state = index === undefined ? session : selectIndex(session, index);
-  const target = commitTarget(state);
-  const hostWindowId = sessionWindowId;
+  const target = resolveCommit(session, tabId);
   await endSession();
-
   if (!target) return;
   try {
     await chrome.tabs.update(target.tabId, { active: true });
-    await chrome.windows.update(target.windowId ?? hostWindowId ?? 0, { focused: true });
+    await chrome.windows.update(target.windowId, { focused: true });
   } catch {
     // The tab disappeared between render and commit.
   }
@@ -298,46 +352,51 @@ async function commit(index?: number): Promise<void> {
 /* -------------------------------------------------------------------------- */
 
 chrome.commands.onCommand.addListener((command) => {
-  if (command === CMD_FORWARD) void step(1);
-  if (command === CMD_BACKWARD) void step(-1);
+  if (command !== CMD_OPEN) return;
+  void (async () => {
+    await ensureReady();
+    // The hotkey only opens; Tab moves the selection from there.
+    if (!session) await openSwitcher();
+  })();
 });
 
 chrome.action.onClicked.addListener(() => {
-  void step(1);
+  void (async () => {
+    await ensureReady();
+    if (!session) await openSwitcher();
+  })();
 });
 
 chrome.runtime.onMessage.addListener((message: FromOverlayMessage, _sender, sendResponse) => {
   switch (message.type) {
-    case 'COMMIT':
-      void commit(message.index);
-      break;
-    case 'CANCEL':
-      void endSession();
-      break;
     case 'STEP':
-      void step(message.delta);
+      if (session && message.epoch === session.epoch) void step(message.delta);
       break;
-    case 'GET_SESSION':
-      void (async () => {
-        sendResponse(
-          session
-            ? {
-                type: 'SHOW',
-                items: session.items,
-                selectedIndex: session.selectedIndex,
-                commitModifiers: await commitModifiers(),
-              }
-            : null,
-        );
-      })();
+    case 'COMMIT':
+      if (session && message.epoch === session.epoch) void commit(message.tabId);
+      break;
+    case 'GET_SESSION': {
+      // The fallback page asks for this once it has loaded, which is the
+      // earliest moment it can receive anything — thumbnails pushed before
+      // then are simply dropped.
+      const current = session;
+      sendResponse(
+        current
+          ? {
+              type: 'SHOW',
+              epoch: current.epoch,
+              items: current.items,
+              selectedIndex: current.selectedIndex,
+              commitModifiers,
+            }
+          : null,
+      );
+      if (current) void sendThumbnails(current);
       return true;
+    }
   }
   return undefined;
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  void ensureReady();
-});
-chrome.runtime.onStartup.addListener(() => {
-  void ensureReady();
-});
+chrome.runtime.onInstalled.addListener(() => void ensureReady());
+chrome.runtime.onStartup.addListener(() => void ensureReady());
