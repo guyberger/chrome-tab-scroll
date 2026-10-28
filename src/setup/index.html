@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="dark" />
+    <style>
+      :root,
+      html,
+      body {
+        background: #202024;
+        margin: 0;
+      }
+      body {
+        width: 380px;
+        color: #f5f5f7;
+        font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        padding: 14px;
+        box-sizing: border-box;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.06);
+        margin-bottom: 8px;
+      }
+      .row .label {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .value {
+        font-weight: 600;
+      }
+      .ok {
+        color: #6ee7a8;
+      }
+      .warn {
+        color: #ffcf6a;
+      }
+      kbd {
+        background: rgba(255, 255, 255, 0.14);
+        border-radius: 4px;
+        padding: 1px 6px;
+        font: inherit;
+        font-weight: 600;
+      }
+      button {
+        font: inherit;
+        color: #f5f5f7;
+        background: #3a6ea8;
+        border: 0;
+        border-radius: 7px;
+        padding: 7px 11px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: rgba(255, 255, 255, 0.12);
+      }
+      button:hover {
+        filter: brightness(1.14);
+      }
+      .hint {
+        opacity: 0.65;
+        margin: 10px 0;
+      }
+      details {
+        margin-top: 12px;
+      }
+      summary {
+        cursor: pointer;
+        opacity: 0.8;
+      }
+      pre {
+        max-height: 190px;
+        overflow: auto;
+        background: #15151a;
+        border-radius: 7px;
+        padding: 9px;
+        font-size: 11px;
+        line-height: 1.45;
+        white-space: pre;
+        margin: 9px 0;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+    </style>
+    <title>Tab Scroll</title>
+  </head>
+  <body>
+    <h1>Tab Scroll</h1>
+
+    <div class="row">
+      <div class="label">Shortcut</div>
+      <div class="value" id="shortcut">…</div>
+    </div>
+
+    <div class="row">
+      <div class="label">Site access</div>
+      <div class="value" id="access">…</div>
+    </div>
+
+    <div id="shortcut-hint" class="hint" hidden>
+      Chrome did not assign a shortcut automatically. Open the shortcuts page
+      and set one for <strong>Show recent tabs</strong>.
+    </div>
+
+    <div id="access-hint" class="hint" hidden>
+      Site access is limited, so the strip cannot be drawn on pages. Set this
+      extension's site access to <strong>On all sites</strong>.
+    </div>
+
+    <div class="actions">
+      <button id="open-shortcuts">Open shortcut settings</button>
+      <button id="copy" class="secondary">Copy diagnostics</button>
+    </div>
+
+    <details id="diagnostics">
+      <summary>Diagnostics</summary>
+      <pre id="log">…</pre>
+      <button id="clear" class="secondary">Clear</button>
+    </details>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

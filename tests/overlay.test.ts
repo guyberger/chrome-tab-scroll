@@ -104,6 +104,28 @@ describe('OverlayView', () => {
     expect(root.querySelectorAll('.preview canvas')).toHaveLength(0);
   });
 
+  // Tabs that predate the extension have no capture, which is most of them
+  // on the first day, so the favicon stands in rather than an empty box.
+  it('uses the favicon as the placeholder when there is one', () => {
+    const { root, view } = mount();
+
+    view.render([item(1, { favIconUrl: 'https://example.test/f.ico' }), item(2)], 0);
+
+    const previews = Array.from(root.querySelectorAll('.preview'));
+    expect(previews[0]?.querySelector('.placeholder-icon')).not.toBeNull();
+    expect(previews[1]?.querySelector('.placeholder')).not.toBeNull();
+  });
+
+  it('falls back to the plain placeholder if the favicon will not load', () => {
+    const { root, view } = mount();
+    view.render([item(1, { favIconUrl: 'https://blocked.test/f.ico' })], 0);
+
+    root.querySelector('.placeholder-icon')!.dispatchEvent(new window.Event('error'));
+
+    expect(root.querySelector('.placeholder-icon')).toBeNull();
+    expect(root.querySelector('.preview .placeholder')).not.toBeNull();
+  });
+
   it('paints arriving thumbnails into a canvas rather than an img', async () => {
     const { root, view } = mount();
     view.render([item(1), item(2)], 0);
